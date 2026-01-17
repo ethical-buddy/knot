@@ -10,7 +10,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap, Tabs},
     Terminal,
 };
-use std::{fs, path::{PathBuf}, process::Command, io};
+use std::{fs, path::{PathBuf}, process::Command, io::{self, Write}};
 use chrono::Local;
 
 #[derive(PartialEq, Clone, Copy)]
@@ -24,14 +24,10 @@ struct App {
     categories: Vec<String>,
     subfolders: Vec<String>,
     files: Vec<PathBuf>,
-    
-    // Name-based tracking to prevent index-shift bugs
     selected_cat: String,
     selected_sub: Option<String>,
-    
     sub_state: ListState,
     file_state: ListState,
-    
     focus: Focus,
     input_mode: InputMode,
     input_buffer: String,
@@ -44,7 +40,11 @@ impl App {
         let mut vault_root = dirs::home_dir().context("Home dir not found")?;
         vault_root.push(".knot_vault");
         if !vault_root.exists() { fs::create_dir_all(&vault_root)?; }
-        let _ = Command::new("git").arg("init").current_dir(&vault_root).status();
+        
+        // Initial init if not exists
+        if !vault_root.join(".git").exists() {
+            let _ = Command::new("git").arg("init").current_dir(&vault_root).status();
+        }
 
         let mut app = Self {
             vault_root,
@@ -59,14 +59,13 @@ impl App {
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             should_quit: false,
-            last_sync: "System Online".into(),
+            last_sync: "Manual".into(),
         };
         app.hard_refresh()?;
         Ok(app)
     }
 
     fn hard_refresh(&mut self) -> Result<()> {
-        // 1. Refresh Categories List
         let mut cats = vec!["[Root]".to_string()];
         if let Ok(entries) = fs::read_dir(&self.vault_root) {
             for entry in entries.flatten() {
@@ -78,18 +77,11 @@ impl App {
         cats.sort();
         self.categories = cats;
 
-        // Verify selected category still exists
         if !self.categories.contains(&self.selected_cat) {
             self.selected_cat = "[Root]".to_string();
         }
 
-        // 2. Refresh Subfolders
-        let cat_path = if self.selected_cat == "[Root]" { 
-            self.vault_root.clone() 
-        } else { 
-            self.vault_root.join(&self.selected_cat) 
-        };
-
+        let cat_path = if self.selected_cat == "[Root]" { self.vault_root.clone() } else { self.vault_root.join(&self.selected_cat) };
         let mut subs = Vec::new();
         if let Ok(entries) = fs::read_dir(&cat_path) {
             for entry in entries.flatten() {
@@ -101,7 +93,6 @@ impl App {
         subs.sort();
         self.subfolders = subs;
 
-        // Sync Subfolder State
         if let Some(ref sub_name) = self.selected_sub {
             if let Some(pos) = self.subfolders.iter().position(|s| s == sub_name) {
                 self.sub_state.select(Some(pos));
@@ -109,17 +100,12 @@ impl App {
                 self.selected_sub = None;
                 self.sub_state.select(if self.subfolders.is_empty() { None } else { Some(0) });
             }
-        } else if !self.subfolders.is_empty() && self.sub_state.selected().is_none() {
-            self.sub_state.select(Some(0));
         }
 
-        // 3. Refresh Files
         let mut file_path = cat_path;
         if let Some(si) = self.sub_state.selected() {
             if si < self.subfolders.len() {
-                let name = &self.subfolders[si];
-                self.selected_sub = Some(name.clone());
-                file_path.push(name);
+                file_path.push(&self.subfolders[si]);
             }
         }
 
@@ -138,23 +124,45 @@ impl App {
         if self.file_state.selected().map_or(true, |i| i >= self.files.len()) {
             self.file_state.select(if self.files.is_empty() { None } else { Some(0) });
         }
-
         Ok(())
     }
 
-    fn git_sync(&mut self, msg: &str) {
-        let now = Local::now().format("%H:%M:%S").to_string();
+    fn manual_sync(&mut self) -> Result<()> {
+        let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        
+        // Temporarily leave TUI to show Git output
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+        disable_raw_mode()?;
+
+        println!("\n--- STARTING GIT SYNC ---");
         let _ = Command::new("git").arg("add").arg(".").current_dir(&self.vault_root).status();
-        let _ = Command::new("git").arg("commit").arg("-m").arg(format!("{}: {}", msg, now)).current_dir(&self.vault_root).status();
-        let _ = Command::new("git").arg("push").current_dir(&self.vault_root).spawn();
+        let _ = Command::new("git").arg("commit").arg("-m").arg(format!("Manual Sync: {}", now)).current_dir(&self.vault_root).status();
+        
+        println!("Pushing to remote...");
+        let status = Command::new("git").arg("push").current_dir(&self.vault_root).status();
+        
+        if let Ok(s) = status {
+            if s.success() { println!("\n✅ Sync Successful!"); }
+            else { println!("\n❌ Sync Failed. Check your network or remote settings."); }
+        }
+
+        print!("\nPress [ENTER] to return to KNOT...");
+        io::stdout().flush()?;
+        let mut temp = String::new();
+        io::stdin().read_line(&mut temp)?;
+
+        enable_raw_mode()?;
+        execute!(io::stdout(), EnterAlternateScreen)?;
         self.last_sync = now;
+        Ok(())
     }
 }
 
 fn main() -> Result<()> {
     enable_raw_mode()?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    execute!(io::stdout(), EnterAlternateScreen)?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
     let mut app = App::new()?;
     let colors = [Color::Cyan, Color::Magenta, Color::Green, Color::Yellow, Color::Blue];
@@ -163,23 +171,22 @@ fn main() -> Result<()> {
         terminal.draw(|f| {
             let area = f.size();
             let chunks = Layout::default().direction(Direction::Vertical).constraints([
-                Constraint::Length(3), // Header
-                Constraint::Length(3), // Categories
-                Constraint::Min(0),    // Main
-                Constraint::Length(3), // Help
+                Constraint::Length(3), 
+                Constraint::Length(3), 
+                Constraint::Min(0),    
+                Constraint::Length(3), 
             ]).split(area);
 
-            f.render_widget(Paragraph::new(format!(" 🚀 KNOT v2 | Sync: {} | Vault: ~/.knot_vault ", app.last_sync))
+            f.render_widget(Paragraph::new(format!(" 🚀 KNOT v2 | Last Sync: {} ", app.last_sync))
                 .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray))), chunks[0]);
 
-            // Categories with Logic-Lock
             let cat_idx = app.categories.iter().position(|c| c == &app.selected_cat).unwrap_or(0);
             let tabs = Tabs::new(app.categories.iter().enumerate().map(|(i, c)| {
                 let color = colors[i % colors.len()];
                 if i == cat_idx { Line::from(vec![Span::styled(format!(" {} ", c), Style::default().bg(color).fg(Color::Black).add_modifier(Modifier::BOLD))]) }
                 else { Line::from(vec![Span::styled(format!(" {} ", c), Style::default().fg(color))]) }
             }).collect())
-            .block(Block::default().borders(Borders::ALL).title(" Categories [H/L] "))
+            .block(Block::default().borders(Borders::ALL).title(" Categories "))
             .select(cat_idx);
             f.render_widget(tabs, chunks[1]);
 
@@ -207,7 +214,7 @@ fn main() -> Result<()> {
             f.render_widget(Paragraph::new(preview).block(Block::default().borders(Borders::ALL).title(" Preview ")).wrap(Wrap{trim:true}), main_chunks[2]);
 
             let footer = match app.input_mode {
-                InputMode::Normal => " [TAB] Focus | [C] New Category | [F] New Folder | [N] New Note | [D] Delete ",
+                InputMode::Normal => " [TAB] Focus | [S] Sync to Cloud | [C/F/N] New | [D] Delete | [Enter] Edit ",
                 InputMode::ConfirmDelete => " !!! PERMANENT DELETE? [y/n] !!! ",
                 _ => " Name: [ENTER] Save | [ESC] Cancel ",
             };
@@ -225,6 +232,7 @@ fn main() -> Result<()> {
                 match app.input_mode {
                     InputMode::Normal => match key.code {
                         KeyCode::Char('q') => app.should_quit = true,
+                        KeyCode::Char('S') => { app.manual_sync()?; terminal.clear()?; }
                         KeyCode::Tab => app.focus = match app.focus { 
                             Focus::Categories => Focus::Subfolders, 
                             Focus::Subfolders => Focus::Files, 
@@ -281,7 +289,7 @@ fn main() -> Result<()> {
                                 execute!(io::stdout(), LeaveAlternateScreen)?; disable_raw_mode()?;
                                 let _ = Command::new("helix").arg(&app.files[i]).status();
                                 enable_raw_mode()?; execute!(io::stdout(), EnterAlternateScreen)?;
-                                app.git_sync("Update"); app.hard_refresh()?;
+                                app.hard_refresh()?;
                                 terminal.clear()?;
                             }
                         }
@@ -297,7 +305,6 @@ fn main() -> Result<()> {
                             };
                             if let Some(p) = path {
                                 if p.is_dir() { let _ = fs::remove_dir_all(p); } else { let _ = fs::remove_file(p); }
-                                app.git_sync("Delete");
                                 if app.focus == Focus::Categories { app.selected_cat = "[Root]".to_string(); }
                             }
                             app.input_mode = InputMode::Normal; app.hard_refresh()?;
@@ -320,7 +327,6 @@ fn main() -> Result<()> {
                                     }
                                     _ => {}
                                 }
-                                app.git_sync("Create");
                             }
                             app.input_mode = InputMode::Normal; app.hard_refresh()?;
                             terminal.clear()?;
