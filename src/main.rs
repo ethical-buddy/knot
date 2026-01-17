@@ -7,211 +7,216 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     prelude::*,
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap, Tabs},
     Terminal,
 };
-use std::{fs, path::PathBuf, process::Command, io, time::SystemTime};
+use std::{fs, path::{PathBuf}, process::Command, io};
+use chrono::Local;
+
+#[derive(PartialEq, Clone, Copy)]
+enum Focus { Categories, Subfolders, Files }
 
 #[derive(PartialEq)]
-enum InputMode { Normal, NewNote, NewCategory, ConfirmDelete, Searching }
-
-#[derive(PartialEq)]
-enum Focus { Categories, Notes }
+enum InputMode { Normal, NewCat, NewFolder, NewNote, ConfirmDelete }
 
 struct App {
-    vault_path: PathBuf,
+    vault_root: PathBuf,
     categories: Vec<String>,
-    notes: Vec<PathBuf>,
-    cat_state: ListState,
-    note_state: ListState,
+    subfolders: Vec<String>,
+    files: Vec<PathBuf>,
+    
+    // Name-based tracking to prevent index-shift bugs
+    selected_cat: String,
+    selected_sub: Option<String>,
+    
+    sub_state: ListState,
+    file_state: ListState,
+    
     focus: Focus,
     input_mode: InputMode,
     input_buffer: String,
-    search_query: String,
     should_quit: bool,
-    zen_mode: bool,
+    last_sync: String,
 }
 
 impl App {
     fn new() -> Result<Self> {
-        let mut vault_path = dirs::home_dir().context("Home dir not found")?;
-        vault_path.push(".knot_vault");
-        if !vault_path.exists() { fs::create_dir_all(&vault_path)?; }
+        let mut vault_root = dirs::home_dir().context("Home dir not found")?;
+        vault_root.push(".knot_vault");
+        if !vault_root.exists() { fs::create_dir_all(&vault_root)?; }
+        let _ = Command::new("git").arg("init").current_dir(&vault_root).status();
 
         let mut app = Self {
-            vault_path,
+            vault_root,
             categories: Vec::new(),
-            notes: Vec::new(),
-            cat_state: ListState::default(),
-            note_state: ListState::default(),
+            subfolders: Vec::new(),
+            files: Vec::new(),
+            selected_cat: "[Root]".to_string(),
+            selected_sub: None,
+            sub_state: ListState::default(),
+            file_state: ListState::default(),
             focus: Focus::Categories,
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
-            search_query: String::new(),
             should_quit: false,
-            zen_mode: false,
+            last_sync: "System Online".into(),
         };
-        app.refresh_categories()?;
+        app.hard_refresh()?;
         Ok(app)
     }
 
-    fn refresh_categories(&mut self) -> Result<()> {
+    fn hard_refresh(&mut self) -> Result<()> {
+        // 1. Refresh Categories List
         let mut cats = vec!["[Root]".to_string()];
-        if let Ok(entries) = fs::read_dir(&self.vault_path) {
-            let mut entries: Vec<_> = entries.flatten().collect();
-            entries.sort_by_key(|e| e.file_name()); // Consistent order
-            for entry in entries {
-                if entry.path().is_dir() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if self.search_query.is_empty() || name.to_lowercase().contains(&self.search_query.to_lowercase()) {
-                        cats.push(name);
-                    }
+        if let Ok(entries) = fs::read_dir(&self.vault_root) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() && !entry.file_name().to_string_lossy().starts_with('.') {
+                    cats.push(entry.file_name().to_string_lossy().to_string());
                 }
             }
         }
+        cats.sort();
         self.categories = cats;
-        
-        // Ensure selection is valid
-        if self.cat_state.selected().is_none() && !self.categories.is_empty() {
-            self.cat_state.select(Some(0));
-        }
-        
-        self.refresh_notes()
-    }
 
-    fn refresh_notes(&mut self) -> Result<()> {
-        let cat_idx = self.cat_state.selected().unwrap_or(0);
-        let path = if cat_idx == 0 || self.categories.len() <= cat_idx { 
-            self.vault_path.clone() 
+        // Verify selected category still exists
+        if !self.categories.contains(&self.selected_cat) {
+            self.selected_cat = "[Root]".to_string();
+        }
+
+        // 2. Refresh Subfolders
+        let cat_path = if self.selected_cat == "[Root]" { 
+            self.vault_root.clone() 
         } else { 
-            self.vault_path.join(&self.categories[cat_idx]) 
+            self.vault_root.join(&self.selected_cat) 
         };
 
-        let mut notes = Vec::new();
-        if let Ok(entries) = fs::read_dir(path) {
+        let mut subs = Vec::new();
+        if let Ok(entries) = fs::read_dir(&cat_path) {
             for entry in entries.flatten() {
-                let filename = entry.file_name().to_string_lossy().to_string();
-                if entry.path().is_file() && filename.ends_with(".md") {
-                    if self.search_query.is_empty() || filename.to_lowercase().contains(&self.search_query.to_lowercase()) {
-                        notes.push(entry.path());
-                    }
+                if entry.path().is_dir() {
+                    subs.push(entry.file_name().to_string_lossy().to_string());
                 }
             }
         }
-        notes.sort_by_key(|p| std::cmp::Reverse(fs::metadata(p).and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH)));
-        self.notes = notes;
+        subs.sort();
+        self.subfolders = subs;
 
-        // Auto-correct selection if list shrinks
-        if let Some(selected) = self.note_state.selected() {
-            if selected >= self.notes.len() {
-                self.note_state.select(if self.notes.is_empty() { None } else { Some(0) });
+        // Sync Subfolder State
+        if let Some(ref sub_name) = self.selected_sub {
+            if let Some(pos) = self.subfolders.iter().position(|s| s == sub_name) {
+                self.sub_state.select(Some(pos));
+            } else {
+                self.selected_sub = None;
+                self.sub_state.select(if self.subfolders.is_empty() { None } else { Some(0) });
             }
-        } else if !self.notes.is_empty() {
-            self.note_state.select(Some(0));
+        } else if !self.subfolders.is_empty() && self.sub_state.selected().is_none() {
+            self.sub_state.select(Some(0));
         }
+
+        // 3. Refresh Files
+        let mut file_path = cat_path;
+        if let Some(si) = self.sub_state.selected() {
+            if si < self.subfolders.len() {
+                let name = &self.subfolders[si];
+                self.selected_sub = Some(name.clone());
+                file_path.push(name);
+            }
+        }
+
+        let mut files = Vec::new();
+        if let Ok(entries) = fs::read_dir(&file_path) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_file() && !p.file_name().unwrap().to_string_lossy().starts_with('.') {
+                    files.push(p);
+                }
+            }
+        }
+        files.sort_by_key(|p| std::cmp::Reverse(fs::metadata(p).and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH)));
+        self.files = files;
+        
+        if self.file_state.selected().map_or(true, |i| i >= self.files.len()) {
+            self.file_state.select(if self.files.is_empty() { None } else { Some(0) });
+        }
+
         Ok(())
     }
 
-    fn get_stats(&self) -> (usize, usize) {
-        if let Some(idx) = self.note_state.selected() {
-            if idx < self.notes.len() {
-                if let Ok(content) = fs::read_to_string(&self.notes[idx]) {
-                    let words = content.split_whitespace().count();
-                    return (words, (words as f32 / 200.0).ceil() as usize);
-                }
-            }
-        }
-        (0, 0)
+    fn git_sync(&mut self, msg: &str) {
+        let now = Local::now().format("%H:%M:%S").to_string();
+        let _ = Command::new("git").arg("add").arg(".").current_dir(&self.vault_root).status();
+        let _ = Command::new("git").arg("commit").arg("-m").arg(format!("{}: {}", msg, now)).current_dir(&self.vault_root).status();
+        let _ = Command::new("git").arg("push").current_dir(&self.vault_root).spawn();
+        self.last_sync = now;
     }
-}
-
-fn parse_md(content: &str) -> Text<'_> {
-    let mut lines = Vec::new();
-    for line in content.lines() {
-        if line.starts_with("# ") {
-            lines.push(Line::from(vec![Span::styled(format!(" # {} ", &line[2..]), Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD))]));
-        } else if line.starts_with("## ") {
-            lines.push(Line::from(vec![Span::styled(line, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))]));
-        } else if line.starts_with("### ") {
-            lines.push(Line::from(vec![Span::styled(line, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))]));
-        } else if line.starts_with("#### ") {
-            lines.push(Line::from(vec![Span::styled(line, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))]));
-        } else {
-            lines.push(Line::from(line));
-        }
-    }
-    Text::from(lines)
-}
-
-fn get_relative_time(path: &PathBuf) -> String {
-    if let Ok(m) = fs::metadata(path) {
-        if let Ok(t) = m.modified() {
-            if let Ok(e) = t.elapsed() {
-                let s = e.as_secs();
-                if s < 60 { return "now".into(); }
-                if s < 3600 { return format!("{}m", s/60); }
-                if s < 86400 { return format!("{}h", s/3600); }
-                return format!("{}d", s/86400);
-            }
-        }
-    }
-    "---".into()
 }
 
 fn main() -> Result<()> {
     enable_raw_mode()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let mut app = App::new()?;
-    terminal.clear()?;
+    execute!(io::stdout(), EnterAlternateScreen)?;
 
-    let palette = [Color::Blue, Color::Green, Color::Yellow, Color::Magenta, Color::Cyan, Color::Red];
+    let mut app = App::new()?;
+    let colors = [Color::Cyan, Color::Magenta, Color::Green, Color::Yellow, Color::Blue];
 
     while !app.should_quit {
         terminal.draw(|f| {
             let area = f.size();
-            let chunks = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(3)]).split(area);
-            
-            let header = if app.input_mode == InputMode::Searching { format!(" 🔍 FILTER: {}_ ", app.search_query) } else { " 📔 KNOT ".into() };
-            f.render_widget(Paragraph::new(header).block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan))), chunks[0]);
+            let chunks = Layout::default().direction(Direction::Vertical).constraints([
+                Constraint::Length(3), // Header
+                Constraint::Length(3), // Categories
+                Constraint::Min(0),    // Main
+                Constraint::Length(3), // Help
+            ]).split(area);
 
-            let body_constraints = if app.zen_mode { [Constraint::Max(0), Constraint::Max(0), Constraint::Percentage(100)] } 
-                                   else { [Constraint::Percentage(22), Constraint::Percentage(33), Constraint::Percentage(45)] };
-            let body = Layout::default().direction(Direction::Horizontal).constraints(body_constraints).split(chunks[1]);
+            f.render_widget(Paragraph::new(format!(" 🚀 KNOT v2 | Sync: {} | Vault: ~/.knot_vault ", app.last_sync))
+                .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray))), chunks[0]);
 
-            if !app.zen_mode {
-                // Category List with Cycling Colors
-                let cats: Vec<ListItem> = app.categories.iter().enumerate().map(|(i, c)| {
-                    let color = palette[i % palette.len()];
-                    ListItem::new(format!("  📂 {}", c)).style(Style::default().fg(color))
-                }).collect();
-                f.render_stateful_widget(List::new(cats).block(Block::default().borders(Borders::ALL).title(" Folders ").border_style(if app.focus == Focus::Categories { Style::default().fg(Color::Yellow) } else { Style::default() })).highlight_style(Style::default().bg(Color::Rgb(50,50,50))), body[0], &mut app.cat_state);
+            // Categories with Logic-Lock
+            let cat_idx = app.categories.iter().position(|c| c == &app.selected_cat).unwrap_or(0);
+            let tabs = Tabs::new(app.categories.iter().enumerate().map(|(i, c)| {
+                let color = colors[i % colors.len()];
+                if i == cat_idx { Line::from(vec![Span::styled(format!(" {} ", c), Style::default().bg(color).fg(Color::Black).add_modifier(Modifier::BOLD))]) }
+                else { Line::from(vec![Span::styled(format!(" {} ", c), Style::default().fg(color))]) }
+            }).collect())
+            .block(Block::default().borders(Borders::ALL).title(" Categories [H/L] "))
+            .select(cat_idx);
+            f.render_widget(tabs, chunks[1]);
 
-                // Note List
-                let notes: Vec<ListItem> = app.notes.iter().map(|n| {
-                    let name = n.file_name().unwrap_or_default().to_string_lossy();
-                    ListItem::new(Line::from(vec![Span::raw(format!("  {} ", name)), Span::styled(get_relative_time(n), Style::default().fg(Color::DarkGray))]))
-                }).collect();
-                f.render_stateful_widget(List::new(notes).block(Block::default().borders(Borders::ALL).title(" Notes ").border_style(if app.focus == Focus::Notes { Style::default().fg(Color::Yellow) } else { Style::default() })).highlight_style(Style::default().bg(Color::Rgb(50,50,50))), body[1], &mut app.note_state);
-            }
+            let main_chunks = Layout::default().direction(Direction::Horizontal).constraints([
+                Constraint::Percentage(20),
+                Constraint::Percentage(30),
+                Constraint::Percentage(50),
+            ]).split(chunks[2]);
 
-            // Preview
-            let (words, mins) = app.get_stats();
-            let content = app.note_state.selected().and_then(|i| app.notes.get(i)).and_then(|p| fs::read_to_string(p).ok()).unwrap_or_default();
-            f.render_widget(Paragraph::new(parse_md(&content)).block(Block::default().borders(Borders::ALL).title(format!(" 📝 Preview [{} words | {}m] ", words, mins))).wrap(Wrap { trim: true }), body[2]);
+            let sub_list = List::new(app.subfolders.iter().map(|s| ListItem::new(format!("  {} ", s))).collect::<Vec<_>>())
+                .block(Block::default().borders(Borders::ALL).title(" Folders ")
+                .border_style(if app.focus == Focus::Subfolders { Style::default().fg(Color::Yellow) } else { Style::default() }))
+                .highlight_style(Style::default().bg(Color::Rgb(40,40,40)));
+            f.render_stateful_widget(sub_list, main_chunks[0], &mut app.sub_state);
 
-            // Footer
+            let file_list = List::new(app.files.iter().map(|p| ListItem::new(format!(" 📄 {} ", p.file_name().unwrap().to_string_lossy()))).collect::<Vec<_>>())
+                .block(Block::default().borders(Borders::ALL).title(" Notes ")
+                .border_style(if app.focus == Focus::Files { Style::default().fg(Color::Yellow) } else { Style::default() }))
+                .highlight_style(Style::default().bg(Color::Rgb(40,40,40)));
+            f.render_stateful_widget(file_list, main_chunks[1], &mut app.file_state);
+
+            let preview = if let Some(i) = app.file_state.selected() {
+                fs::read_to_string(&app.files[i]).unwrap_or_else(|_| "Error reading file".into())
+            } else { "---".into() };
+            f.render_widget(Paragraph::new(preview).block(Block::default().borders(Borders::ALL).title(" Preview ")).wrap(Wrap{trim:true}), main_chunks[2]);
+
             let footer = match app.input_mode {
-                InputMode::Normal => " [/] Search | [z] Zen | [Tab] Focus | [c] New Cat | [n] New Note | [d] Delete | [Enter] Helix ",
-                InputMode::ConfirmDelete => " ! DELETE? [y] Yes | [n] No ",
-                _ => " Typing... [Enter] Save | [Esc] Cancel ",
+                InputMode::Normal => " [TAB] Focus | [C] New Category | [F] New Folder | [N] New Note | [D] Delete ",
+                InputMode::ConfirmDelete => " !!! PERMANENT DELETE? [y/n] !!! ",
+                _ => " Name: [ENTER] Save | [ESC] Cancel ",
             };
-            f.render_widget(Paragraph::new(footer).block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray))), chunks[2]);
+            f.render_widget(Paragraph::new(footer).block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray))), chunks[3]);
 
-            // Modals
-            if matches!(app.input_mode, InputMode::NewNote | InputMode::NewCategory) {
-                let m_area = centered_rect(40, 15, area);
-                f.render_widget(Clear, m_area);
-                f.render_widget(Paragraph::new(app.input_buffer.as_str()).block(Block::default().borders(Borders::ALL).title(" Name Item ")), m_area);
+            if app.input_mode != InputMode::Normal && app.input_mode != InputMode::ConfirmDelete {
+                let box_area = centered_rect(50, 15, area);
+                f.render_widget(Clear, box_area);
+                f.render_widget(Paragraph::new(app.input_buffer.as_str()).block(Block::default().borders(Borders::ALL).title(" Input ")), box_area);
             }
         })?;
 
@@ -220,78 +225,109 @@ fn main() -> Result<()> {
                 match app.input_mode {
                     InputMode::Normal => match key.code {
                         KeyCode::Char('q') => app.should_quit = true,
-                        KeyCode::Char('z') => app.zen_mode = !app.zen_mode,
-                        KeyCode::Char('/') => { app.input_mode = InputMode::Searching; app.search_query.clear(); }
-                        KeyCode::Tab => app.focus = if app.focus == Focus::Categories { Focus::Notes } else { Focus::Categories },
-                        KeyCode::Char('c') => { app.input_mode = InputMode::NewCategory; app.input_buffer.clear(); }
-                        KeyCode::Char('n') => { app.input_mode = InputMode::NewNote; app.input_buffer.clear(); }
-                        KeyCode::Char('d') => app.input_mode = InputMode::ConfirmDelete,
-                        KeyCode::Enter | KeyCode::Char('e') => {
-                            if let Some(i) = app.note_state.selected() {
-                                if i < app.notes.len() {
-                                    disable_raw_mode()?; execute!(io::stdout(), LeaveAlternateScreen)?;
-                                    let _ = Command::new("helix").arg(&app.notes[i]).status();
-                                    enable_raw_mode()?; execute!(io::stdout(), EnterAlternateScreen)?;
-                                    terminal.clear()?; app.refresh_notes()?;
+                        KeyCode::Tab => app.focus = match app.focus { 
+                            Focus::Categories => Focus::Subfolders, 
+                            Focus::Subfolders => Focus::Files, 
+                            Focus::Files => Focus::Categories 
+                        },
+                        KeyCode::Char('h') | KeyCode::Left => {
+                            let cur_idx = app.categories.iter().position(|c| c == &app.selected_cat).unwrap_or(0);
+                            let new_idx = if cur_idx == 0 { app.categories.len() - 1 } else { cur_idx - 1 };
+                            app.selected_cat = app.categories[new_idx].clone();
+                            app.hard_refresh()?;
+                        }
+                        KeyCode::Char('l') | KeyCode::Right => {
+                            let cur_idx = app.categories.iter().position(|c| c == &app.selected_cat).unwrap_or(0);
+                            let new_idx = (cur_idx + 1) % app.categories.len();
+                            app.selected_cat = app.categories[new_idx].clone();
+                            app.hard_refresh()?;
+                        }
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            match app.focus {
+                                Focus::Subfolders if !app.subfolders.is_empty() => {
+                                    let i = (app.sub_state.selected().unwrap_or(0) + 1) % app.subfolders.len();
+                                    app.sub_state.select(Some(i));
+                                    app.selected_sub = Some(app.subfolders[i].clone());
                                 }
+                                Focus::Files if !app.files.is_empty() => {
+                                    let i = (app.file_state.selected().unwrap_or(0) + 1) % app.files.len();
+                                    app.file_state.select(Some(i));
+                                }
+                                _ => {}
+                            }
+                            app.hard_refresh()?;
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            match app.focus {
+                                Focus::Subfolders if !app.subfolders.is_empty() => {
+                                    let i = if app.sub_state.selected().unwrap_or(0) == 0 { app.subfolders.len()-1 } else { app.sub_state.selected().unwrap()-1 };
+                                    app.sub_state.select(Some(i));
+                                    app.selected_sub = Some(app.subfolders[i].clone());
+                                }
+                                Focus::Files if !app.files.is_empty() => {
+                                    let i = if app.file_state.selected().unwrap_or(0) == 0 { app.files.len()-1 } else { app.file_state.selected().unwrap()-1 };
+                                    app.file_state.select(Some(i));
+                                }
+                                _ => {}
+                            }
+                            app.hard_refresh()?;
+                        }
+                        KeyCode::Char('C') => { app.input_mode = InputMode::NewCat; app.input_buffer.clear(); }
+                        KeyCode::Char('F') => { app.input_mode = InputMode::NewFolder; app.input_buffer.clear(); }
+                        KeyCode::Char('N') => { app.input_mode = InputMode::NewNote; app.input_buffer.clear(); }
+                        KeyCode::Char('D') => { app.input_mode = InputMode::ConfirmDelete; }
+                        KeyCode::Enter if app.focus == Focus::Files => {
+                            if let Some(i) = app.file_state.selected() {
+                                execute!(io::stdout(), LeaveAlternateScreen)?; disable_raw_mode()?;
+                                let _ = Command::new("helix").arg(&app.files[i]).status();
+                                enable_raw_mode()?; execute!(io::stdout(), EnterAlternateScreen)?;
+                                app.git_sync("Update"); app.hard_refresh()?;
+                                terminal.clear()?;
                             }
                         }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            if app.focus == Focus::Categories && !app.categories.is_empty() {
-                                let next = (app.cat_state.selected().unwrap_or(0) + 1) % app.categories.len();
-                                app.cat_state.select(Some(next)); app.refresh_notes()?;
-                            } else if !app.notes.is_empty() {
-                                let next = (app.note_state.selected().unwrap_or(0) + 1) % app.notes.len();
-                                app.note_state.select(Some(next));
-                            }
-                        }
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            if app.focus == Focus::Categories && !app.categories.is_empty() {
-                                let i = app.cat_state.selected().unwrap_or(0);
-                                let ni = if i == 0 { app.categories.len() - 1 } else { i - 1 };
-                                app.cat_state.select(Some(ni)); app.refresh_notes()?;
-                            } else if !app.notes.is_empty() {
-                                let i = app.note_state.selected().unwrap_or(0);
-                                let ni = if i == 0 { app.notes.len() - 1 } else { i - 1 };
-                                app.note_state.select(Some(ni));
-                            }
-                        }
-                        _ => {}
-                    },
-                    InputMode::Searching => match key.code {
-                        KeyCode::Enter | KeyCode::Esc => { app.input_mode = InputMode::Normal; }
-                        KeyCode::Backspace => { app.search_query.pop(); app.refresh_categories()?; }
-                        KeyCode::Char(c) => { app.search_query.push(c); app.refresh_categories()?; }
                         _ => {}
                     },
                     InputMode::ConfirmDelete => match key.code {
                         KeyCode::Char('y') => {
-                            if app.focus == Focus::Categories {
-                                let i = app.cat_state.selected().unwrap_or(0);
-                                if i != 0 { let _ = fs::remove_dir_all(app.vault_path.join(&app.categories[i])); }
-                            } else if let Some(i) = app.note_state.selected() {
-                                if i < app.notes.len() { let _ = fs::remove_file(&app.notes[i]); }
+                            let path = match app.focus {
+                                Focus::Categories if app.selected_cat != "[Root]" => Some(app.vault_root.join(&app.selected_cat)),
+                                Focus::Subfolders => app.sub_state.selected().map(|i| app.vault_root.join(&app.selected_cat).join(&app.subfolders[i])),
+                                Focus::Files => app.file_state.selected().map(|i| app.files[i].clone()),
+                                _ => None,
+                            };
+                            if let Some(p) = path {
+                                if p.is_dir() { let _ = fs::remove_dir_all(p); } else { let _ = fs::remove_file(p); }
+                                app.git_sync("Delete");
+                                if app.focus == Focus::Categories { app.selected_cat = "[Root]".to_string(); }
                             }
-                            app.refresh_categories()?; app.input_mode = InputMode::Normal;
-                        }
+                            app.input_mode = InputMode::Normal; app.hard_refresh()?;
+                            terminal.clear()?;
+                        },
                         _ => app.input_mode = InputMode::Normal,
                     },
                     _ => match key.code {
                         KeyCode::Enter => {
-                            if !app.input_buffer.is_empty() {
-                                if app.input_mode == InputMode::NewCategory {
-                                    let _ = fs::create_dir_all(app.vault_path.join(&app.input_buffer));
-                                } else {
-                                    let cat_idx = app.cat_state.selected().unwrap_or(0);
-                                    let path = if cat_idx == 0 { app.vault_path.clone() } else { app.vault_path.join(&app.categories[cat_idx]) };
-                                    let _ = fs::write(path.join(format!("{}.md", app.input_buffer)), "# New Note\n");
+                            let buf = app.input_buffer.clone();
+                            if !buf.is_empty() {
+                                let base = if app.selected_cat == "[Root]" { app.vault_root.clone() } else { app.vault_root.join(&app.selected_cat) };
+                                match app.input_mode {
+                                    InputMode::NewCat => { let _ = fs::create_dir_all(app.vault_root.join(&buf)); app.selected_cat = buf; }
+                                    InputMode::NewFolder => { let _ = fs::create_dir_all(base.join(&buf)); app.selected_sub = Some(buf); }
+                                    InputMode::NewNote => {
+                                        let mut p = base;
+                                        if let Some(ref s) = app.selected_sub { p.push(s); }
+                                        let _ = fs::write(p.join(format!("{}.md", buf)), "# New Note");
+                                    }
+                                    _ => {}
                                 }
+                                app.git_sync("Create");
                             }
-                            app.input_buffer.clear(); app.input_mode = InputMode::Normal; app.refresh_categories()?;
+                            app.input_mode = InputMode::Normal; app.hard_refresh()?;
+                            terminal.clear()?;
                         }
                         KeyCode::Esc => app.input_mode = InputMode::Normal,
+                        KeyCode::Char(c) => app.input_buffer.push(c),
                         KeyCode::Backspace => { app.input_buffer.pop(); }
-                        KeyCode::Char(c) => { app.input_buffer.push(c); }
                         _ => {}
                     }
                 }
